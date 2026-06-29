@@ -1,13 +1,14 @@
 """
 Agent de decouverte automatique de niches dropshipping - SEO faible concurrence
 ---------------------------------------------------------------------------------
-Version 7 : corrige deux bugs precis identifies sur le rapport precedent.
-1. Une categorie de depart ressortait en double a cause d'une simple difference
-   d'accent ("decoration chambre" vs "decoration chambre" -> comparaison
-   normalisee sans accents desormais, des deux cotes.
-2. "Coach" (marque de sacs) n'etait filtree ni par la liste de secours, ni par
-   Wikipedia -> ajoutee a la main + meme normalisation des accents appliquee
-   a la detection de marques pour eviter ce trou a l'avenir.
+Version 8 : le systeme de pause/retry contre les 429 fonctionne (confirme par
+les logs - les lots bloques ont fini par reussir a la 2e tentative). Le vrai
+probleme etait le seuil de score, trop exigeant car relatif a "recette cuisine"
+(l'une des requetes les plus tapees en France) : il cachait la quasi-totalite
+des mots-cles pourtant correctement mesures. Suppression du seuil couperet,
+remplace par un classement + etiquette qualitative. Legere augmentation du
+nombre de categories explorees, le mecanisme anti-blocage ayant prouve sa
+fiabilite.
 
 Auteur : genere par Claude pour Romain
 """
@@ -58,10 +59,9 @@ CATEGORIES_WIKIPEDIA_MARQUES = [
 
 MOT_CLE_ANCRE = "recette cuisine"
 
-NB_CATEGORIES_PAR_JOUR = 6
+NB_CATEGORIES_PAR_JOUR = 8
 NB_VARIANTES_PAR_CATEGORIE = 4
-SEUIL_SCORE_RELATIF_MIN = 5
-TOP_N_RESULTATS = 12
+TOP_N_RESULTATS = 15
 
 PAUSE_ENTRE_LOTS = 15
 PAUSE_AVANT_RETRY = 25
@@ -75,8 +75,6 @@ HEADERS_WIKIPEDIA = {
 
 
 def normaliser(texte):
-    """Enleve les accents et mets en minuscule, pour comparer deux mots-cles
-    sans se faire avoir par une simple difference d'accentuation."""
     texte = texte.lower().strip()
     texte = unicodedata.normalize("NFKD", texte)
     return "".join(c for c in texte if not unicodedata.combining(c))
@@ -130,9 +128,11 @@ def get_suggestions_google(mot_cle, n=NB_VARIANTES_PAR_CATEGORIE):
 def get_scores_relatifs(mots_cles, geo="FR"):
     pytrends = TrendReq(hl="fr-FR", tz=60, retries=1, backoff_factor=0)
     resultats = {}
+    nb_lots = (len(mots_cles) + 3) // 4
 
-    for i in range(0, len(mots_cles), 4):
-        lot = mots_cles[i:i + 4] + [MOT_CLE_ANCRE]
+    for index_lot in range(nb_lots):
+        debut = index_lot * 4
+        lot = mots_cles[debut:debut + 4] + [MOT_CLE_ANCRE]
 
         for tentative in range(2):
             try:
@@ -156,8 +156,9 @@ def get_scores_relatifs(mots_cles, geo="FR"):
                     print(f"  -> Pause de {PAUSE_AVANT_RETRY}s avant nouvel essai...")
                     time.sleep(PAUSE_AVANT_RETRY)
 
-        print(f"  -> Pause de {PAUSE_ENTRE_LOTS}s avant le prochain lot...")
-        time.sleep(PAUSE_ENTRE_LOTS)
+        if index_lot < nb_lots - 1:
+            print(f"  -> Pause de {PAUSE_ENTRE_LOTS}s avant le prochain lot...")
+            time.sleep(PAUSE_ENTRE_LOTS)
 
     return resultats
 
@@ -170,6 +171,15 @@ def score_concurrence_estime(mot_cle):
         return "Moyenne"
     else:
         return "Probablement elevee (mot-cle trop court/generique)"
+
+
+def etiquette_volume(score):
+    if score >= 20:
+        return "Fort"
+    elif score >= 5:
+        return "Moyen"
+    else:
+        return "Faible"
 
 
 def decouvrir_opportunites():
@@ -196,12 +206,16 @@ def decouvrir_opportunites():
 
     print("Etape 4/4 - Mesure du volume relatif (ancre = recette cuisine)...")
     scores = get_scores_relatifs(toutes_variantes)
-    candidats = [mot for mot, score in scores.items() if score >= SEUIL_SCORE_RELATIF_MIN]
-    print(f"  -> {len(candidats)} mots-cles depassent le seuil")
+    print(f"  -> {len(scores)} mots-cles mesures avec succes")
 
     opportunites = [
-        {"mot_cle": mot, "score": scores[mot], "estimation": score_concurrence_estime(mot)}
-        for mot in candidats
+        {
+            "mot_cle": mot,
+            "score": score,
+            "volume": etiquette_volume(score),
+            "estimation": score_concurrence_estime(mot),
+        }
+        for mot, score in scores.items()
     ]
     opportunites.sort(key=lambda x: x["score"], reverse=True)
     return opportunites[:TOP_N_RESULTATS]
@@ -210,16 +224,16 @@ def decouvrir_opportunites():
 def formater_message(opportunites):
     date_str = datetime.now().strftime("%d/%m/%Y")
     if not opportunites:
-        return f"Rapport decouverte niches du {date_str}\n\nAucune opportunite detectee aujourd'hui."
+        return f"Rapport decouverte niches du {date_str}\n\nAucun mot-cle mesure avec succes aujourd'hui (Google a probablement tout bloque)."
 
     lignes = [f"*Rapport decouverte niches du {date_str}*\n"]
     for o in opportunites:
         lignes.append(
             f"*{o['mot_cle']}*\n"
-            f"   Score volume (relatif) : {o['score']}\n"
+            f"   Volume relatif : {o['volume']} (score {o['score']})\n"
             f"   Concurrence estimee : {o['estimation']}\n"
         )
-    lignes.append("\nScore relatif a un mot-cle de reference, pas un volume reel. Verifie toujours manuellement la 1ere page Google avant de te lancer.")
+    lignes.append("\nScore relatif a 'recette cuisine'. Verifie toujours manuellement la 1ere page Google avant de te lancer.")
     return "\n".join(lignes)
 
 
