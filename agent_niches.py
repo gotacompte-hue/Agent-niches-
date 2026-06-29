@@ -1,14 +1,14 @@
 """
 Agent de decouverte automatique de niches dropshipping - SEO faible concurrence
 ---------------------------------------------------------------------------------
-Version 8 : le systeme de pause/retry contre les 429 fonctionne (confirme par
-les logs - les lots bloques ont fini par reussir a la 2e tentative). Le vrai
-probleme etait le seuil de score, trop exigeant car relatif a "recette cuisine"
-(l'une des requetes les plus tapees en France) : il cachait la quasi-totalite
-des mots-cles pourtant correctement mesures. Suppression du seuil couperet,
-remplace par un classement + etiquette qualitative. Legere augmentation du
-nombre de categories explorees, le mecanisme anti-blocage ayant prouve sa
-fiabilite.
+Version 9 : corrige le vrai probleme du rapport precedent. "recette cuisine"
+etait un trop gros poisson comme mot-cle de reference : il ecrasait quasiment
+tous les autres mots-cles a 0 dans la reponse brute de Google (avant meme mon
+calcul de ratio), car Google Trends arrondit a l'entier sur une echelle 0-100
+par requete. Remplace par "coque telephone", un terme e-commerce courant et
+donc bien plus proche en ordre de grandeur des mots-cles produits qu'on teste.
+Ajout d'une distinction claire entre "volume mesure a 0" et "volume non
+mesurable avec ce repere" pour ne pas afficher une fausse precision.
 
 Auteur : genere par Claude pour Romain
 """
@@ -24,10 +24,12 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "METS_TON_TOKEN_ICI")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "METS_TON_CHAT_ID_ICI")
 
+# "coque telephone" sert desormais UNIQUEMENT de repere fixe (retire des
+# categories explorees pour ne pas faire double emploi)
 CATEGORIES_SEED = [
     "accessoire cuisine", "rangement maison", "decoration chambre", "luminaire salon",
     "bijoux femme", "bijoux homme", "montre femme", "sac a main", "lunettes de soleil",
-    "accessoire telephone", "coque telephone", "gadget bureau", "accessoire voiture",
+    "gadget bureau", "accessoire voiture",
     "accessoire moto", "soin visage", "soin cheveux", "maquillage", "parfum femme",
     "accessoire bebe", "jouet enfant", "accessoire animaux", "jouet chien", "accessoire chat",
     "equipement fitness", "accessoire yoga", "materiel camping", "accessoire jardin",
@@ -57,7 +59,7 @@ CATEGORIES_WIKIPEDIA_MARQUES = [
     "Marque de parfum",
 ]
 
-MOT_CLE_ANCRE = "recette cuisine"
+MOT_CLE_ANCRE = "coque telephone"
 
 NB_CATEGORIES_PAR_JOUR = 8
 NB_VARIANTES_PAR_CATEGORIE = 4
@@ -126,6 +128,10 @@ def get_suggestions_google(mot_cle, n=NB_VARIANTES_PAR_CATEGORIE):
 
 
 def get_scores_relatifs(mots_cles, geo="FR"):
+    """
+    Retourne un dict mot_cle -> score relatif (None si en-dessous du seuil de
+    mesure, distinct d'un vrai zero).
+    """
     pytrends = TrendReq(hl="fr-FR", tz=60, retries=1, backoff_factor=0)
     resultats = {}
     nb_lots = (len(mots_cles) + 3) // 4
@@ -148,7 +154,10 @@ def get_scores_relatifs(mots_cles, geo="FR"):
                 for mot in lot[:-1]:
                     if mot in data.columns:
                         valeur_brute = data[mot].mean()
-                        resultats[mot] = round((valeur_brute / valeur_ancre) * 100, 1)
+                        if valeur_brute <= 0:
+                            resultats[mot] = None  # non mesurable a cette echelle
+                        else:
+                            resultats[mot] = round((valeur_brute / valeur_ancre) * 100, 1)
                 break
             except Exception as e:
                 print(f"Erreur volume pour {lot} (tentative {tentative + 1}/2) : {e}")
@@ -174,9 +183,11 @@ def score_concurrence_estime(mot_cle):
 
 
 def etiquette_volume(score):
-    if score >= 20:
+    if score is None:
+        return "Non mesurable (sous le seuil)"
+    elif score >= 50:
         return "Fort"
-    elif score >= 5:
+    elif score >= 15:
         return "Moyen"
     else:
         return "Faible"
@@ -204,9 +215,10 @@ def decouvrir_opportunites():
     toutes_variantes = list(toutes_variantes)
     print(f"  -> {len(toutes_variantes)} variantes generees apres filtrage")
 
-    print("Etape 4/4 - Mesure du volume relatif (ancre = recette cuisine)...")
+    print(f"Etape 4/4 - Mesure du volume relatif (repere = '{MOT_CLE_ANCRE}')...")
     scores = get_scores_relatifs(toutes_variantes)
-    print(f"  -> {len(scores)} mots-cles mesures avec succes")
+    nb_mesures = sum(1 for v in scores.values() if v is not None)
+    print(f"  -> {len(scores)} mots-cles traites, {nb_mesures} mesures avec une vraie valeur")
 
     opportunites = [
         {
@@ -217,23 +229,25 @@ def decouvrir_opportunites():
         }
         for mot, score in scores.items()
     ]
-    opportunites.sort(key=lambda x: x["score"], reverse=True)
+    # Trie : les scores mesures (les plus forts d'abord), puis les non-mesurables a la fin
+    opportunites.sort(key=lambda x: (x["score"] is None, -(x["score"] or 0)))
     return opportunites[:TOP_N_RESULTATS]
 
 
 def formater_message(opportunites):
     date_str = datetime.now().strftime("%d/%m/%Y")
     if not opportunites:
-        return f"Rapport decouverte niches du {date_str}\n\nAucun mot-cle mesure avec succes aujourd'hui (Google a probablement tout bloque)."
+        return f"Rapport decouverte niches du {date_str}\n\nAucun mot-cle traite avec succes aujourd'hui (Google a probablement tout bloque)."
 
     lignes = [f"*Rapport decouverte niches du {date_str}*\n"]
     for o in opportunites:
+        score_affiche = o["score"] if o["score"] is not None else "-"
         lignes.append(
             f"*{o['mot_cle']}*\n"
-            f"   Volume relatif : {o['volume']} (score {o['score']})\n"
+            f"   Volume relatif : {o['volume']} (score {score_affiche})\n"
             f"   Concurrence estimee : {o['estimation']}\n"
         )
-    lignes.append("\nScore relatif a 'recette cuisine'. Verifie toujours manuellement la 1ere page Google avant de te lancer.")
+    lignes.append(f"\nScore relatif a '{MOT_CLE_ANCRE}'. Verifie toujours manuellement la 1ere page Google avant de te lancer.")
     return "\n".join(lignes)
 
 
