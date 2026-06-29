@@ -5,8 +5,13 @@ Cherche, pour une liste de mots-cles produits, les meilleures options
 fournisseurs chez CJ Dropshipping (prix, livraison, personnalisation,
 nombre de boutiques qui le vendent deja) et envoie un rapport sur Telegram.
 
-Utilise une vraie API officielle et gratuite -> pas de blocage, pas de
-scraping fragile comme pour l'agent niches.
+Version 2 : corrige un vrai bug identifie sur le premier rapport. Le catalogue
+CJ est indexe en anglais/chinois, pas en francais -> chercher en francais
+("licorne", "personnalise") ne matche presque rien, sauf des mots qui
+s'ecrivent pareil dans les deux langues ("stickers"), ce qui ramenait des
+produits sans rapport. Mots-cles passes en anglais. Suppression aussi du tri
+force par nombre de boutiques (qui ecrasait la pertinence) au profit du tri
+par defaut "meilleure correspondance".
 
 Auteur: genere par Claude pour Romain
 """
@@ -20,13 +25,14 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "METS_TON_TOKEN_ICI")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "METS_TON_CHAT_ID_ICI")
 CJ_API_KEY = os.environ.get("CJ_API_KEY", "METS_TA_CLE_CJ_ICI")
 
-# Modifie cette liste avec les produits que tu veux verifier
+# Mots-cles en ANGLAIS (le catalogue CJ est indexe en anglais/chinois,
+# chercher en francais ne renvoie quasiment rien d'exploitable)
 MOTS_CLES_PRODUITS = [
-    "stickers muraux licorne",
-    "papier peint panoramique licorne",
-    "stickers personnalisé prenom enfant",
-    "guirlande lumineuse licorne",
-    "coussin licorne enfant",
+    "unicorn wall stickers",
+    "unicorn wallpaper mural",
+    "personalized name stickers kids",
+    "unicorn fairy lights",
+    "unicorn cushion pillow kids",
 ]
 
 NB_PRODUITS_PAR_MOT_CLE = 5
@@ -50,8 +56,9 @@ def rechercher_produits(token, mot_cle, taille=NB_PRODUITS_PAR_MOT_CLE):
         "keyWord": mot_cle,
         "page": 1,
         "size": taille,
-        "sort": "desc",
-        "orderBy": 1,  # tri par nombre de listings (produits deja valides par d'autres vendeurs)
+        # Pas de tri force : on garde le tri par defaut "meilleure
+        # correspondance" (orderBy=0) pour que la pertinence prime sur la
+        # popularite.
     }
     r = requests.get(url, headers=headers, params=params, timeout=10)
     data = r.json()
@@ -98,14 +105,13 @@ def construire_rapport():
         else:
             for p in produits:
                 lignes.append(formater_produit(p))
-        time.sleep(1)  # respecte la limite gratuite de 1 requete/seconde
+        time.sleep(1)
 
     return "\n".join(lignes)
 
 
 def envoyer_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # Telegram limite un message a 4096 caracteres ; on coupe si besoin
     morceaux = [message[i:i + 3500] for i in range(0, len(message), 3500)]
     for morceau in morceaux:
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": morceau, "parse_mode": "Markdown"}
