@@ -1,15 +1,12 @@
 """
 Agent de decouverte automatique de niches dropshipping - SEO faible concurrence
 ---------------------------------------------------------------------------------
-Version 5 :
-1. Filtre les marques de facon dynamique (categories Wikipedia + liste de
-   secours) au lieu d'une liste figee a la main qu'il faut sans cesse completer
-2. Corrige un vrai biais de mesure : Google Trends normalise chaque lot de
-   mots-cles entre 0 et 100 *au sein du lot*. Sans correction, un mot-cle a
-   fort volume dans son lot ecrase tous les autres, meme s'ils ont un vrai
-   volume correct en absolu -> ajout d'un mot-cle "ancre" fixe dans chaque lot
-   pour rendre les scores enfin comparables entre eux.
-3. Explore un peu plus large pour compenser les mots-cles retires (marques)
+Version 6 : Google Trends limite tres agressivement les requetes automatisees
+(quasi tous les lots echouaient avec des erreurs 429 "too many requests").
+Ce n'est pas un bug a corriger dans la logique, c'est un vrai mur a contourner :
+on explore moins de mots-cles par jour, mais avec de vraies pauses entre chaque
+requete + une nouvelle tentative en cas d'echec, pour que les resultats obtenus
+soient fiables plutot que majoritairement perdus.
 
 Auteur : genere par Claude pour Romain
 """
@@ -58,10 +55,13 @@ CATEGORIES_WIKIPEDIA_MARQUES = [
 
 MOT_CLE_ANCRE = "recette cuisine"
 
-NB_CATEGORIES_PAR_JOUR = 14
-NB_VARIANTES_PAR_CATEGORIE = 8
+NB_CATEGORIES_PAR_JOUR = 6
+NB_VARIANTES_PAR_CATEGORIE = 4
 SEUIL_SCORE_RELATIF_MIN = 5
 TOP_N_RESULTATS = 12
+
+PAUSE_ENTRE_LOTS = 15
+PAUSE_AVANT_RETRY = 25
 
 HEADERS_GOOGLE = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -117,28 +117,42 @@ def get_suggestions_google(mot_cle, n=NB_VARIANTES_PAR_CATEGORIE):
 
 
 def get_scores_relatifs(mots_cles, geo="FR"):
-    pytrends = TrendReq(hl="fr-FR", tz=60)
+    """
+    Mesure le volume relatif par lots de 4 mots-cles + l'ancre fixe.
+    On desactive les micro-retries internes de la librairie (trop rapides pour
+    etre utiles contre un vrai rate-limit) et on gere nous-memes une pause
+    longue + une seule nouvelle tentative par lot.
+    """
+    pytrends = TrendReq(hl="fr-FR", tz=60, retries=1, backoff_factor=0)
     resultats = {}
 
     for i in range(0, len(mots_cles), 4):
         lot = mots_cles[i:i + 4] + [MOT_CLE_ANCRE]
-        try:
-            pytrends.build_payload(lot, cat=0, timeframe="today 1-m", geo=geo)
-            data = pytrends.interest_over_time()
 
-            if MOT_CLE_ANCRE not in data.columns:
-                continue
-            valeur_ancre = data[MOT_CLE_ANCRE].mean()
-            if valeur_ancre <= 0:
-                continue
+        for tentative in range(2):
+            try:
+                pytrends.build_payload(lot, cat=0, timeframe="today 1-m", geo=geo)
+                data = pytrends.interest_over_time()
 
-            for mot in lot[:-1]:
-                if mot in data.columns:
-                    valeur_brute = data[mot].mean()
-                    resultats[mot] = round((valeur_brute / valeur_ancre) * 100, 1)
-            time.sleep(2)
-        except Exception as e:
-            print(f"Erreur volume pour {lot} : {e}")
+                if MOT_CLE_ANCRE not in data.columns:
+                    break
+                valeur_ancre = data[MOT_CLE_ANCRE].mean()
+                if valeur_ancre <= 0:
+                    break
+
+                for mot in lot[:-1]:
+                    if mot in data.columns:
+                        valeur_brute = data[mot].mean()
+                        resultats[mot] = round((valeur_brute / valeur_ancre) * 100, 1)
+                break
+            except Exception as e:
+                print(f"Erreur volume pour {lot} (tentative {tentative + 1}/2) : {e}")
+                if tentative == 0:
+                    print(f"  -> Pause de {PAUSE_AVANT_RETRY}s avant nouvel essai...")
+                    time.sleep(PAUSE_AVANT_RETRY)
+
+        print(f"  -> Pause de {PAUSE_ENTRE_LOTS}s avant le prochain lot...")
+        time.sleep(PAUSE_ENTRE_LOTS)
 
     return resultats
 
