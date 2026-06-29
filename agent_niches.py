@@ -17,16 +17,12 @@ from datetime import datetime
 from pytrends.request import TrendReq
 import requests
 
-# ============================================
-# CONFIGURATION
-# ============================================
-
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "METS_TON_TOKEN_ICI")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "METS_TON_CHAT_ID_ICI")
 
 NB_TENDANCES_DEPART = 15
 NB_VARIANTES_PAR_TENDANCE = 5
-SEUIL_VOLUME_MIN = 20
+SEUIL_VOLUME_MIN = 10
 
 GROS_SITES = [
     "amazon", "cdiscount", "fnac", "leroymerlin", "leroy-merlin",
@@ -35,7 +31,7 @@ GROS_SITES = [
     "wikipedia", "youtube", "pinterest",
 ]
 
-MAX_GROS_SITES_TOLERES = 3
+MAX_GROS_SITES_TOLERES = 5
 TOP_N_RESULTATS = 8
 
 HEADERS = {
@@ -86,19 +82,28 @@ def get_volume_trends(mots_cles, geo="FR"):
 
 
 def analyser_concurrence(mot_cle):
+    """
+    Compte le nombre de 'gros sites' présents dans les résultats Google
+    pour estimer si le mot-clé est accessible à un petit site.
+    Si Google bloque la requête, on ne rejette pas le mot-clé : on le marque
+    comme "non vérifié" pour que Romain puisse le checker à la main.
+    """
     url = "https://www.google.com/search"
     params = {"q": mot_cle, "num": 10, "hl": "fr", "gl": "fr"}
     try:
         response = requests.get(url, params=params, headers=HEADERS, timeout=8)
-        contenu = response.text.lower()
 
+        if response.status_code != 200 or "captcha" in response.text.lower():
+            return {"nb_gros_sites": None, "accessible": True, "verifie": False}
+
+        contenu = response.text.lower()
         nb_gros_sites = sum(1 for site in GROS_SITES if site in contenu)
         accessible = nb_gros_sites <= MAX_GROS_SITES_TOLERES
 
-        return {"nb_gros_sites": nb_gros_sites, "accessible": accessible}
+        return {"nb_gros_sites": nb_gros_sites, "accessible": accessible, "verifie": True}
     except Exception as e:
         print(f"Erreur analyse concurrence pour '{mot_cle}' : {e}")
-        return {"nb_gros_sites": None, "accessible": None}
+        return {"nb_gros_sites": None, "accessible": True, "verifie": False}
 
 
 def decouvrir_opportunites():
@@ -133,6 +138,7 @@ def decouvrir_opportunites():
                 "mot_cle": mot,
                 "volume": volumes[mot],
                 "nb_gros_sites": concurrence["nb_gros_sites"],
+                "verifie": concurrence["verifie"],
             })
         time.sleep(2)
 
@@ -147,10 +153,14 @@ def formater_message(opportunites):
 
     lignes = [f"📊 *Rapport découverte niches du {date_str}*\n"]
     for o in opportunites:
+        if o["verifie"]:
+            ligne_concurrence = f"   Gros sites en page 1 : {o['nb_gros_sites']}\n"
+        else:
+            ligne_concurrence = "   Concurrence : ⚠️ non vérifiée (à checker à la main)\n"
         lignes.append(
             f"🔎 *{o['mot_cle']}*\n"
             f"   Volume Trends : {o['volume']}/100\n"
-            f"   Gros sites en page 1 : {o['nb_gros_sites']}\n"
+            f"{ligne_concurrence}"
         )
     lignes.append("\n💡 Vérifie manuellement la 1ère page Google avant de te lancer — ce score est indicatif.")
     return "\n".join(lignes)
