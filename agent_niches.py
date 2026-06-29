@@ -2,7 +2,7 @@
 Agent de découverte automatique de niches dropshipping - SEO faible concurrence
 ---------------------------------------------------------------------------------
 Ce script, SANS liste prédéfinie :
-1. Récupère les tendances de recherche du jour en France (Google Trends - Trending Now)
+1. Récupère les tendances de recherche du jour en France (Google Trends RSS)
 2. Pour chaque tendance, génère des variantes de mots-clés (Google Autocomplete)
 3. Pour chaque variante, analyse qui occupe la 1ère page Google (gros sites vs petits sites)
 4. Calcule un score = volume de recherche élevé + faible présence de gros sites
@@ -14,7 +14,7 @@ Auteur : généré par Claude pour Romain
 import os
 import time
 from datetime import datetime
-from pytrends.request import TrendReq
+from pytrends_modern import TrendReq, TrendsRSS
 import requests
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "METS_TON_TOKEN_ICI")
@@ -40,13 +40,18 @@ HEADERS = {
 
 
 def get_tendances_du_jour():
-    pytrends = TrendReq(hl="fr-FR", tz=60)
+    """
+    Récupère les recherches tendances en France aujourd'hui via le flux RSS
+    de Google Trends (rapide et fiable, contrairement à l'ancienne méthode
+    de scraping qui ne fonctionne plus en 2026).
+    """
     try:
-        df = pytrends.trending_searches(pn="france")
-        tendances = df[0].tolist()[:NB_TENDANCES_DEPART]
+        rss = TrendsRSS()
+        trends = rss.get_trends(geo="FR")
+        tendances = [t["title"] for t in trends][:NB_TENDANCES_DEPART]
         return tendances
     except Exception as e:
-        print(f"Erreur récupération tendances : {e}")
+        print(f"Erreur récupération tendances (RSS) : {e}")
         return []
 
 
@@ -82,12 +87,6 @@ def get_volume_trends(mots_cles, geo="FR"):
 
 
 def analyser_concurrence(mot_cle):
-    """
-    Compte le nombre de 'gros sites' présents dans les résultats Google
-    pour estimer si le mot-clé est accessible à un petit site.
-    Si Google bloque la requête, on ne rejette pas le mot-clé : on le marque
-    comme "non vérifié" pour que Romain puisse le checker à la main.
-    """
     url = "https://www.google.com/search"
     params = {"q": mot_cle, "num": 10, "hl": "fr", "gl": "fr"}
     try:
