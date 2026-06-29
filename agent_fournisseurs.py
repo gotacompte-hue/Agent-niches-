@@ -1,18 +1,14 @@
 """
 Agent de recherche de fournisseurs CJ Dropshipping
 ---------------------------------------------------
-Version 5 : corrige deux bugs identifies sur le rapport precedent.
-1. "Expedition: Type non precise" partout -> le champ productType renvoye par
-   l'API est un code numerique (0,1,3,4,5), pas le nom textuel utilise dans
-   l'exemple de la doc. Mapping corrige.
-2. Le moteur de recherche CJ semble surtout matcher le PREMIER mot de la
-   requete et quasi ignorer le second -> "unicorn X" ne renvoie rien (CJ n'a
-   probablement pas grand chose indexe sous "unicorn"+mot precis), et
-   "personalized sticker" renvoyait des produits sans rapport (ouvre-bouteille,
-   ongles...) qui matchent juste "personalized", un adjectif generique.
-   Correction : chaque concept essaie plusieurs formulations de requete dans
-   l'ordre, et la pertinence est verifiee sur le bon mot (le nom du produit,
-   pas un adjectif generique).
+Version 6 : ajoute un diagnostic decisif. Sur le rapport precedent, "unicorn"
++ n'importe quel second mot donnait 0 resultat partout (stickers, papier
+peint, coussin, linge de lit, tapis, lampe) alors que d'autres mots generiques
+fonctionnaient bien -> on teste maintenant "unicorn" SEUL, sans filtre, pour
+savoir si CJ a vraiment quasi rien sous ce terme ou si un second mot
+quelconque casse la recherche. Renomme aussi la categorie "Stickers
+personnalises" pour clarifier qu'elle n'a rien a voir avec les licornes
+(generique personnalisation/prenom uniquement).
 
 Auteur: genere par Claude pour Romain
 """
@@ -26,10 +22,6 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "METS_TON_TOKEN_ICI")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "METS_TON_CHAT_ID_ICI")
 CJ_API_KEY = os.environ.get("CJ_API_KEY", "METS_TA_CLE_CJ_ICI")
 
-# Chaque concept = plusieurs formulations a essayer dans l'ordre (la 1ere qui
-# donne des resultats pertinents gagne) + les mots qui doivent VRAIMENT
-# apparaitre dans le nom du produit pour qu'on le garde (pas un adjectif
-# generique comme "personalized"/"custom").
 CONCEPTS = [
     {
         "label": "Stickers muraux licorne",
@@ -42,7 +34,7 @@ CONCEPTS = [
         "mots_validation": ["unicorn", "mural"],
     },
     {
-        "label": "Stickers personnalises (prenom)",
+        "label": "Stickers personnalises - generique (PAS specifique licorne)",
         "requetes": ["custom name sticker", "personalized name decal", "name sticker kids"],
         "mots_validation": ["sticker", "decal", "label"],
     },
@@ -72,7 +64,6 @@ NB_PRODUITS_BRUTS = 20
 NB_PRODUITS_AFFICHES = 5
 BASE_URL = "https://developers.cjdropshipping.com/api2.0/v1"
 
-# Codes numeriques reels renvoyes par l'API (cf. table "Product Type" de la doc CJ)
 LABELS_LOGISTIQUE = {
     "0": "Gere et expedie par CJ directement (automatique)",
     "1": "Produit de service (stockage CJ)",
@@ -107,6 +98,19 @@ def rechercher_produits(token, mot_cle, taille=NB_PRODUITS_BRUTS):
     return contenu[0].get("productList", [])
 
 
+def diagnostic_unicorn_seul(token):
+    """Test decisif : 'unicorn' tout seul, sans filtre. Si ca renvoie plein
+    de resultats, le probleme vient du second mot associe. Si ca renvoie
+    quasi rien, CJ n'a simplement pas ce theme en profondeur."""
+    print("DIAGNOSTIC : recherche 'unicorn' seul, sans filtre...")
+    bruts = rechercher_produits(token, "unicorn", taille=20)
+    print(f"  -> {len(bruts)} resultats bruts pour 'unicorn' seul")
+    exemples = [p.get("nameEn", "?") for p in bruts[:5]]
+    for ex in exemples:
+        print(f"     - {ex}")
+    return bruts
+
+
 def filtrer_pertinents(produits, mots_validation, n=NB_PRODUITS_AFFICHES):
     pertinents = [
         p for p in produits
@@ -116,11 +120,10 @@ def filtrer_pertinents(produits, mots_validation, n=NB_PRODUITS_AFFICHES):
 
 
 def chercher_concept(token, concept):
-    """Essaie chaque formulation dans l'ordre jusqu'a en trouver une qui donne
-    des resultats pertinents. Renvoie (produits, requete_qui_a_marche)."""
     for requete in concept["requetes"]:
         print(f"  Essai requete : {requete}")
         bruts = rechercher_produits(token, requete)
+        print(f"    -> {len(bruts)} resultats bruts avant filtrage")
         pertinents = filtrer_pertinents(bruts, concept["mots_validation"])
         time.sleep(1)
         if pertinents:
@@ -176,6 +179,9 @@ def construire_rapport():
     date_str = datetime.now().strftime("%d/%m/%Y")
     lignes = [f"*Rapport fournisseurs CJ du {date_str}*\n"]
 
+    diag = diagnostic_unicorn_seul(token)
+    lignes.append(f"_Diagnostic : 'unicorn' seul (sans filtre) = {len(diag)} resultat(s) bruts chez CJ._\n")
+
     for concept in CONCEPTS:
         print(f"Concept : {concept['label']}")
         produits, requete_gagnante = chercher_concept(token, concept)
@@ -183,7 +189,7 @@ def construire_rapport():
 
         if not produits:
             essais = ", ".join(concept["requetes"])
-            lignes.append(f"Rien trouve malgre {len(concept['requetes'])} formulations testees ({essais}). Probablement absent du catalogue CJ, a verifier sur AliExpress.")
+            lignes.append(f"Rien trouve malgre {len(concept['requetes'])} formulations testees ({essais}).")
             continue
 
         lignes.append(f"_(trouve via : \"{requete_gagnante}\")_")
