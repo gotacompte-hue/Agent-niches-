@@ -1,12 +1,13 @@
 """
 Agent de decouverte automatique de niches dropshipping - SEO faible concurrence
 ---------------------------------------------------------------------------------
-Version 6 : Google Trends limite tres agressivement les requetes automatisees
-(quasi tous les lots echouaient avec des erreurs 429 "too many requests").
-Ce n'est pas un bug a corriger dans la logique, c'est un vrai mur a contourner :
-on explore moins de mots-cles par jour, mais avec de vraies pauses entre chaque
-requete + une nouvelle tentative en cas d'echec, pour que les resultats obtenus
-soient fiables plutot que majoritairement perdus.
+Version 7 : corrige deux bugs precis identifies sur le rapport precedent.
+1. Une categorie de depart ressortait en double a cause d'une simple difference
+   d'accent ("decoration chambre" vs "decoration chambre" -> comparaison
+   normalisee sans accents desormais, des deux cotes.
+2. "Coach" (marque de sacs) n'etait filtree ni par la liste de secours, ni par
+   Wikipedia -> ajoutee a la main + meme normalisation des accents appliquee
+   a la detection de marques pour eviter ce trou a l'avenir.
 
 Auteur : genere par Claude pour Romain
 """
@@ -14,6 +15,7 @@ Auteur : genere par Claude pour Romain
 import os
 import time
 import random
+import unicodedata
 from datetime import date, datetime
 from pytrends_modern import TrendReq
 import requests
@@ -40,6 +42,7 @@ MARQUES_SECOURS = [
     "versace", "burberry", "fendi", "balenciaga", "saint laurent", "cartier",
     "tommy hilfiger", "levis", "converse", "vans", "puma", "new balance", "ysl",
     "tissot", "casio", "fossil", "swatch", "festina", "seiko", "citizen",
+    "coach", "guess", "yves rocher", "kenzo", "longchamp", "furla",
 ]
 
 CATEGORIES_WIKIPEDIA_MARQUES = [
@@ -71,13 +74,21 @@ HEADERS_WIKIPEDIA = {
 }
 
 
+def normaliser(texte):
+    """Enleve les accents et mets en minuscule, pour comparer deux mots-cles
+    sans se faire avoir par une simple difference d'accentuation."""
+    texte = texte.lower().strip()
+    texte = unicodedata.normalize("NFKD", texte)
+    return "".join(c for c in texte if not unicodedata.combining(c))
+
+
 def choisir_categories_du_jour():
     random.seed(date.today().isoformat())
     return random.sample(CATEGORIES_SEED, k=min(NB_CATEGORIES_PAR_JOUR, len(CATEGORIES_SEED)))
 
 
 def get_marques_wikipedia():
-    marques = set(MARQUES_SECOURS)
+    marques = set(normaliser(m) for m in MARQUES_SECOURS)
     url = "https://fr.wikipedia.org/w/api.php"
     for cat in CATEGORIES_WIKIPEDIA_MARQUES:
         try:
@@ -92,7 +103,7 @@ def get_marques_wikipedia():
             r = requests.get(url, params=params, headers=HEADERS_WIKIPEDIA, timeout=8)
             data = r.json()
             for member in data.get("query", {}).get("categorymembers", []):
-                marques.add(member["title"].lower())
+                marques.add(normaliser(member["title"]))
         except Exception as e:
             print(f"Erreur recuperation marques Wikipedia pour '{cat}' : {e}")
     print(f"  -> {len(marques)} marques connues chargees (Wikipedia + liste de secours)")
@@ -100,7 +111,7 @@ def get_marques_wikipedia():
 
 
 def est_une_marque(mot_cle, marques):
-    mc = mot_cle.lower()
+    mc = normaliser(mot_cle)
     return any(marque in mc for marque in marques)
 
 
@@ -117,12 +128,6 @@ def get_suggestions_google(mot_cle, n=NB_VARIANTES_PAR_CATEGORIE):
 
 
 def get_scores_relatifs(mots_cles, geo="FR"):
-    """
-    Mesure le volume relatif par lots de 4 mots-cles + l'ancre fixe.
-    On desactive les micro-retries internes de la librairie (trop rapides pour
-    etre utiles contre un vrai rate-limit) et on gere nous-memes une pause
-    longue + une seule nouvelle tentative par lot.
-    """
     pytrends = TrendReq(hl="fr-FR", tz=60, retries=1, backoff_factor=0)
     resultats = {}
 
@@ -172,7 +177,7 @@ def decouvrir_opportunites():
     marques = get_marques_wikipedia()
 
     categories = choisir_categories_du_jour()
-    categories_lower = [c.lower().strip() for c in categories]
+    categories_normalisees = [normaliser(c) for c in categories]
     print(f"Etape 2/4 - Categories explorees aujourd'hui : {categories}")
 
     print("Etape 3/4 - Generation des variantes via Google Autocomplete...")
@@ -180,7 +185,7 @@ def decouvrir_opportunites():
     for cat in categories:
         for variante in get_suggestions_google(cat):
             v = variante.strip()
-            if v.lower() in categories_lower:
+            if normaliser(v) in categories_normalisees:
                 continue
             if est_une_marque(v, marques):
                 continue
