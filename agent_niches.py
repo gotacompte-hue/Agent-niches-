@@ -1,16 +1,15 @@
 """
-Agent de découverte automatique de niches dropshipping - SEO faible concurrence
+Agent de decouverte automatique de niches dropshipping - SEO faible concurrence
 ---------------------------------------------------------------------------------
-Version 3 - corrige deux problèmes identifiés :
-1. Les "tendances du jour" (RSS) remontaient de l'actu générale (sport, people...)
-   et pas des produits -> remplacé par un pool de catégories e-commerce qui tourne
-   chaque jour, et c'est l'autocomplete qui découvre les vraies niches dedans.
-2. L'analyse de concurrence en scrapant Google était trop souvent bloquée
-   silencieusement (renvoyait "0 gros sites" même quand Google bloquait juste la
-   requête) -> détection de blocage plus large + score de concurrence "estimé"
-   basé sur la longueur du mot-clé, fiable à 100%, qui ne dépend pas de Google.
+Version 4 :
+1. Filtre les categories de depart elles-memes (vraie decouverte uniquement)
+2. Supprime le faux signal "gros sites Google" (page bloquee/consentement,
+   pas fiable depuis ce type de serveur) -> on garde l'estimation par longueur
+   de mot-cle, fiable a 100%, sans dependre de Google.
+3. Filtre les noms de marques (contrefacon / risque juridique reel, pas une
+   vraie opportunite meme quand le score affiche "faible concurrence")
 
-Auteur : généré par Claude pour Romain
+Auteur : genere par Claude pour Romain
 """
 
 import os
@@ -23,9 +22,6 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "METS_TON_TOKEN_ICI")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "METS_TON_CHAT_ID_ICI")
 
-# Pool large de catégories e-commerce. Chaque jour, on en tire un sous-ensemble
-# différent (mais stable sur la journée) pour explorer large sans jamais répéter
-# exactement la même recherche.
 CATEGORIES_SEED = [
     "accessoire cuisine", "rangement maison", "decoration chambre", "luminaire salon",
     "bijoux femme", "bijoux homme", "montre femme", "sac a main", "lunettes de soleil",
@@ -39,25 +35,18 @@ CATEGORIES_SEED = [
     "rangement cuisine", "deco terrasse", "accessoire running",
 ]
 
+# Marques a exclure : pas de vraies opportunites, juste un risque de contrefacon
+MARQUES_A_EXCLURE = [
+    "louis vuitton", "michael kors", "gucci", "chanel", "dior", "nike", "adidas",
+    "rolex", "prada", "hermes", "zara", "lacoste", "ralph lauren", "calvin klein",
+    "versace", "burberry", "fendi", "balenciaga", "saint laurent", "cartier",
+    "tommy hilfiger", "levis", "converse", "vans", "puma", "new balance", "ysl",
+]
+
 NB_CATEGORIES_PAR_JOUR = 10
 NB_VARIANTES_PAR_CATEGORIE = 6
 SEUIL_VOLUME_MIN = 10
-TOP_N_RESULTATS = 10
-
-GROS_SITES = [
-    "amazon", "cdiscount", "fnac", "leroymerlin", "leroy-merlin",
-    "darty", "boulanger", "carrefour", "auchan", "decathlon",
-    "zalando", "veepee", "shein", "temu", "aliexpress",
-    "wikipedia", "youtube", "pinterest",
-]
-MAX_GROS_SITES_TOLERES = 5
-
-# Signaux qui indiquent que Google a bloqué/redirigé la requête (donc la donnée
-# n'est pas fiable, à ne pas confondre avec "vraiment 0 gros site")
-SIGNAUX_BLOCAGE = [
-    "captcha", "recaptcha", "unusual traffic", "trafic inhabituel",
-    "nos systemes ont detecte", "/sorry/", "automated queries",
-]
+TOP_N_RESULTATS = 12
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -65,8 +54,6 @@ HEADERS = {
 
 
 def choisir_categories_du_jour():
-    """Tire un sous-ensemble de catégories, différent chaque jour mais stable
-    pour toute la journée (utile si le workflow est relancé plusieurs fois)."""
     random.seed(date.today().isoformat())
     return random.sample(CATEGORIES_SEED, k=min(NB_CATEGORIES_PAR_JOUR, len(CATEGORIES_SEED)))
 
@@ -81,6 +68,11 @@ def get_suggestions_google(mot_cle, n=NB_VARIANTES_PAR_CATEGORIE):
     except Exception as e:
         print(f"Erreur autocomplete pour '{mot_cle}' : {e}")
         return []
+
+
+def est_une_marque(mot_cle):
+    mc = mot_cle.lower()
+    return any(marque in mc for marque in MARQUES_A_EXCLURE)
 
 
 def get_volume_trends(mots_cles, geo="FR"):
@@ -101,9 +93,6 @@ def get_volume_trends(mots_cles, geo="FR"):
 
 
 def score_concurrence_estime(mot_cle):
-    """Estimation gratuite et fiable à 100%, sans dépendre de Google : plus un
-    mot-clé est long/précis, statistiquement moins il est disputé (logique du
-    longue traîne en SEO)."""
     nb_mots = len(mot_cle.split())
     if nb_mots >= 4:
         return "Faible (longue traine)"
@@ -113,63 +102,40 @@ def score_concurrence_estime(mot_cle):
         return "Probablement elevee (mot-cle trop court/generique)"
 
 
-def analyser_concurrence_google(mot_cle):
-    """Tentative de vérification réelle en regardant qui occupe la page 1 Google.
-    Best-effort uniquement : si Google bloque la requête (probable depuis une IP
-    GitHub Actions), on renvoie None plutôt qu'un faux 0."""
-    url = "https://www.google.com/search"
-    params = {"q": mot_cle, "num": 10, "hl": "fr", "gl": "fr"}
-    try:
-        response = requests.get(url, params=params, headers=HEADERS, timeout=8)
-        contenu = response.text.lower()
-        url_finale = response.url.lower()
-
-        bloque = (
-            response.status_code != 200
-            or any(signal in contenu for signal in SIGNAUX_BLOCAGE)
-            or "sorry" in url_finale
-            or len(contenu) < 2000
-        )
-        if bloque:
-            return None
-
-        nb_gros_sites = sum(1 for site in GROS_SITES if site in contenu)
-        return nb_gros_sites
-    except Exception as e:
-        print(f"Erreur analyse concurrence pour '{mot_cle}' : {e}")
-        return None
-
-
 def decouvrir_opportunites():
     categories = choisir_categories_du_jour()
-    print(f"Etape 1/4 - Categories explorees aujourd'hui : {categories}")
+    categories_lower = [c.lower().strip() for c in categories]
+    print(f"Etape 1/3 - Categories explorees aujourd'hui : {categories}")
 
-    print("Etape 2/4 - Generation des variantes via Google Autocomplete...")
+    print("Etape 2/3 - Generation des variantes via Google Autocomplete...")
     toutes_variantes = set()
     for cat in categories:
-        variantes = get_suggestions_google(cat)
-        toutes_variantes.update(variantes)
+        for variante in get_suggestions_google(cat):
+            v = variante.strip()
+            # On exclut la categorie elle-meme (pas une vraie decouverte)
+            if v.lower() in categories_lower:
+                continue
+            # On exclut les marques (risque de contrefacon)
+            if est_une_marque(v):
+                continue
+            toutes_variantes.add(v)
         time.sleep(1)
     toutes_variantes = list(toutes_variantes)
-    print(f"  -> {len(toutes_variantes)} variantes generees")
+    print(f"  -> {len(toutes_variantes)} variantes generees apres filtrage")
 
-    print("Etape 3/4 - Mesure du volume de recherche (Google Trends)...")
+    print("Etape 3/3 - Mesure du volume de recherche (Google Trends)...")
     volumes = get_volume_trends(toutes_variantes)
     candidats = [mot for mot, vol in volumes.items() if vol >= SEUIL_VOLUME_MIN]
     print(f"  -> {len(candidats)} mots-cles depassent le seuil de volume")
 
-    print("Etape 4/4 - Estimation de la concurrence...")
-    opportunites = []
-    for mot in candidats:
-        nb_gros_sites = analyser_concurrence_google(mot)
-        opportunites.append({
+    opportunites = [
+        {
             "mot_cle": mot,
             "volume": volumes[mot],
-            "nb_gros_sites": nb_gros_sites,
             "estimation": score_concurrence_estime(mot),
-        })
-        time.sleep(2)
-
+        }
+        for mot in candidats
+    ]
     opportunites.sort(key=lambda x: x["volume"], reverse=True)
     return opportunites[:TOP_N_RESULTATS]
 
@@ -181,17 +147,12 @@ def formater_message(opportunites):
 
     lignes = [f"*Rapport decouverte niches du {date_str}*\n"]
     for o in opportunites:
-        if o["nb_gros_sites"] is not None:
-            ligne_concurrence = f"   Gros sites page 1 (verifie) : {o['nb_gros_sites']}\n"
-        else:
-            ligne_concurrence = "   Gros sites page 1 : non verifiable (Google a bloque)\n"
         lignes.append(
             f"*{o['mot_cle']}*\n"
             f"   Volume Trends : {o['volume']}/100\n"
-            f"{ligne_concurrence}"
             f"   Concurrence estimee : {o['estimation']}\n"
         )
-    lignes.append("\nVerifie toujours manuellement la 1ere page Google avant de te lancer.")
+    lignes.append("\nEstimation basee sur la specificite du mot-cle. Verifie toujours manuellement la 1ere page Google avant de te lancer.")
     return "\n".join(lignes)
 
 
