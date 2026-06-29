@@ -1,14 +1,12 @@
 """
 Agent de decouverte automatique de niches dropshipping - SEO faible concurrence
 ---------------------------------------------------------------------------------
-Version 9 : corrige le vrai probleme du rapport precedent. "recette cuisine"
-etait un trop gros poisson comme mot-cle de reference : il ecrasait quasiment
-tous les autres mots-cles a 0 dans la reponse brute de Google (avant meme mon
-calcul de ratio), car Google Trends arrondit a l'entier sur une echelle 0-100
-par requete. Remplace par "coque telephone", un terme e-commerce courant et
-donc bien plus proche en ordre de grandeur des mots-cles produits qu'on teste.
-Ajout d'une distinction claire entre "volume mesure a 0" et "volume non
-mesurable avec ce repere" pour ne pas afficher une fausse precision.
+Version 10 : ameliore la fiabilite face aux blocages 429 de Google Trends.
+- 3 tentatives par lot au lieu de 2, avec des pauses qui s'allongent (20s, 35s)
+- Pause entre lots un peu plus longue (20s au lieu de 15s) pour rester sous le
+  radar du rate-limit
+- Les mots-cles definitivement perdus (echec des 3 tentatives) sont maintenant
+  comptes et signales dans le rapport au lieu de disparaitre sans explication
 
 Auteur : genere par Claude pour Romain
 """
@@ -24,8 +22,6 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "METS_TON_TOKEN_ICI")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "METS_TON_CHAT_ID_ICI")
 
-# "coque telephone" sert desormais UNIQUEMENT de repere fixe (retire des
-# categories explorees pour ne pas faire double emploi)
 CATEGORIES_SEED = [
     "accessoire cuisine", "rangement maison", "decoration chambre", "luminaire salon",
     "bijoux femme", "bijoux homme", "montre femme", "sac a main", "lunettes de soleil",
@@ -65,8 +61,8 @@ NB_CATEGORIES_PAR_JOUR = 8
 NB_VARIANTES_PAR_CATEGORIE = 4
 TOP_N_RESULTATS = 15
 
-PAUSE_ENTRE_LOTS = 15
-PAUSE_AVANT_RETRY = 25
+PAUSE_ENTRE_LOTS = 20
+PAUSES_RETRY = [20, 35]  # pauses avant la 2e puis la 3e tentative
 
 HEADERS_GOOGLE = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -129,18 +125,22 @@ def get_suggestions_google(mot_cle, n=NB_VARIANTES_PAR_CATEGORIE):
 
 def get_scores_relatifs(mots_cles, geo="FR"):
     """
-    Retourne un dict mot_cle -> score relatif (None si en-dessous du seuil de
-    mesure, distinct d'un vrai zero).
+    Retourne (resultats, mots_perdus).
+    resultats : mot_cle -> score (None si en-dessous du seuil de mesure)
+    mots_perdus : liste des mots-cles n'ayant pas pu etre mesures du tout
+    (Google a refuse les 3 tentatives)
     """
     pytrends = TrendReq(hl="fr-FR", tz=60, retries=1, backoff_factor=0)
     resultats = {}
+    mots_perdus = []
     nb_lots = (len(mots_cles) + 3) // 4
 
     for index_lot in range(nb_lots):
         debut = index_lot * 4
         lot = mots_cles[debut:debut + 4] + [MOT_CLE_ANCRE]
+        succes = False
 
-        for tentative in range(2):
+        for tentative in range(3):
             try:
                 pytrends.build_payload(lot, cat=0, timeframe="today 1-m", geo=geo)
                 data = pytrends.interest_over_time()
@@ -155,21 +155,27 @@ def get_scores_relatifs(mots_cles, geo="FR"):
                     if mot in data.columns:
                         valeur_brute = data[mot].mean()
                         if valeur_brute <= 0:
-                            resultats[mot] = None  # non mesurable a cette echelle
+                            resultats[mot] = None
                         else:
                             resultats[mot] = round((valeur_brute / valeur_ancre) * 100, 1)
+                succes = True
                 break
             except Exception as e:
-                print(f"Erreur volume pour {lot} (tentative {tentative + 1}/2) : {e}")
-                if tentative == 0:
-                    print(f"  -> Pause de {PAUSE_AVANT_RETRY}s avant nouvel essai...")
-                    time.sleep(PAUSE_AVANT_RETRY)
+                print(f"Erreur volume pour {lot} (tentative {tentative + 1}/3) : {e}")
+                if tentative < 2:
+                    pause = PAUSES_RETRY[tentative]
+                    print(f"  -> Pause de {pause}s avant nouvel essai...")
+                    time.sleep(pause)
+
+        if not succes:
+            mots_perdus.extend(lot[:-1])
+            print(f"  -> Lot abandonne apres 3 echecs : {lot[:-1]}")
 
         if index_lot < nb_lots - 1:
             print(f"  -> Pause de {PAUSE_ENTRE_LOTS}s avant le prochain lot...")
             time.sleep(PAUSE_ENTRE_LOTS)
 
-    return resultats
+    return resultats, mots_perdus
 
 
 def score_concurrence_estime(mot_cle):
@@ -216,9 +222,9 @@ def decouvrir_opportunites():
     print(f"  -> {len(toutes_variantes)} variantes generees apres filtrage")
 
     print(f"Etape 4/4 - Mesure du volume relatif (repere = '{MOT_CLE_ANCRE}')...")
-    scores = get_scores_relatifs(toutes_variantes)
+    scores, mots_perdus = get_scores_relatifs(toutes_variantes)
     nb_mesures = sum(1 for v in scores.values() if v is not None)
-    print(f"  -> {len(scores)} mots-cles traites, {nb_mesures} mesures avec une vraie valeur")
+    print(f"  -> {len(scores)} mots-cles traites, {nb_mesures} mesures avec une vraie valeur, {len(mots_perdus)} perdus")
 
     opportunites = [
         {
@@ -229,12 +235,11 @@ def decouvrir_opportunites():
         }
         for mot, score in scores.items()
     ]
-    # Trie : les scores mesures (les plus forts d'abord), puis les non-mesurables a la fin
     opportunites.sort(key=lambda x: (x["score"] is None, -(x["score"] or 0)))
-    return opportunites[:TOP_N_RESULTATS]
+    return opportunites[:TOP_N_RESULTATS], len(mots_perdus)
 
 
-def formater_message(opportunites):
+def formater_message(opportunites, nb_perdus):
     date_str = datetime.now().strftime("%d/%m/%Y")
     if not opportunites:
         return f"Rapport decouverte niches du {date_str}\n\nAucun mot-cle traite avec succes aujourd'hui (Google a probablement tout bloque)."
@@ -248,6 +253,8 @@ def formater_message(opportunites):
             f"   Concurrence estimee : {o['estimation']}\n"
         )
     lignes.append(f"\nScore relatif a '{MOT_CLE_ANCRE}'. Verifie toujours manuellement la 1ere page Google avant de te lancer.")
+    if nb_perdus > 0:
+        lignes.append(f"\n({nb_perdus} mot(s)-cle(s) n'ont pas pu etre mesures aujourd'hui, Google a bloque la requete malgre 3 tentatives.)")
     return "\n".join(lignes)
 
 
@@ -262,8 +269,8 @@ def envoyer_telegram(message):
 
 
 def main():
-    opportunites = decouvrir_opportunites()
-    message = formater_message(opportunites)
+    opportunites, nb_perdus = decouvrir_opportunites()
+    message = formater_message(opportunites, nb_perdus)
     print("\n--- Message final ---\n" + message)
     envoyer_telegram(message)
 
